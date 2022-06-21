@@ -1,0 +1,94 @@
+from sre_parse import FLAGS
+import torch
+import argparse
+
+import torch.distributed as dist
+import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel as DDP
+from yaml import load
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--local_rank", default=-1)
+FLAGS = parser.parse_args()
+local_rank = FLAGS.local_rank
+
+
+
+# a. 根据local_rank来设定当前使用哪块gpu
+torch.cuda.set_device(local_rank)
+dist.init_process_group(backend='nccl')
+
+device = torch.device("cuda", local_rank)
+model = nn.Linear(10,10).to(device)
+
+model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+
+
+"""
+有一个很重要的概念，就是数据的并行化。
+我们知道，DDP同时起了很多个进程，但是他们用的是同一份数据，那么就会有数据上的冗余性。也就是说，你平时一个epoch如果是一万份数据，现在就要变成1*16=16万份数据了。
+那么，我们需要使用一个特殊的sampler，来使得各个进程上的数据各不相同，进而让一个epoch还是1万份数据。
+幸福的是，DDP也帮我们做好了。
+"""
+
+train_sampler = torch.utils.data.distributed.DistributedSampler(my_dataset)
+# 需要注意的是，这里的batch_size指的是每个进程下的batch_siz。也就是说，总batch_size是这里的batch_size再乘以并行数(world_size)
+trainloader = torch.utils.data.DataLoader(my_trainset, batch_size=batch_size, sampler=train_sampler)
+
+for epoch in range(num_epochs):
+    # 设置sampler的epoch，DistributedSampler需要这个来维持哥哥进程之间的相同随机种子
+    trainloader.sampler.set_epoch(epoch)  # TODO
+    for data, label in trainloader:
+        pass
+
+
+
+# 保存参数
+# 1. save模型的时候，和DP模式一样，有一个需要注意的点：保存的是model.module而不是model。
+#    因为model其实是DDP model，参数是被`model=DDP(model)`包起来的。
+# 2. 我只需要在进程0上保存一次就行了，避免多次保存重复的东西。
+
+if dist.get_rank() == 0:
+    torch.save(model.module, "svaed_model.skpt")
+
+'''
+调用方式
+像我们在QuickStart里面看到的，DDP模型下，python源代码的调用方式和原来的不一样了。现在，需要用torch.distributed.launch来启动训练。
+
+作用
+在这里，我们给出分布式训练的重要参数：
+有多少台机器？
+--nnodes
+当前是哪台机器？
+--node_rank
+每台机器有多少个进程？
+--nproc_per_node
+高级参数（可以先不看，多机模式才会用到）
+通讯的address
+通讯的port
+实现方式
+我们需要在每一台机子（总共m台）上都运行一次torch.distributed.launch
+每个torch.distributed.launch会启动n个进程，并给每个进程一个--local_rank=i的参数
+这就是之前需要"新增:从外面得到local_rank参数"的原因
+这样我们就得到n*m个进程，world_size=n*m
+'''
+
+## Bash运行
+# 假设我们只在一台机器上运行，可用卡数是8
+
+
+# python -m torch.distributed.launch --nproc_per_node 8 main.py
+
+
+# 小技巧
+
+# # 假设我们只用4,5,6,7号卡
+
+# CUDA_VISIBLE_DEVICES="4,5,6,7" python -m torch.distributed.launch --nproc_per_node 4 main.py
+
+# # 假如我们还有另外一个实验要跑，也就是同时跑两个不同实验。
+# #    这时，为避免master_port冲突，我们需要指定一个新的。这里我随便敲了一个。
+
+# CUDA_VISIBLE_DEVICES="4,5,6,7" python -m torch.distributed.launch --nproc_per_node 4 \
+#     --master_port 53453 main.py
